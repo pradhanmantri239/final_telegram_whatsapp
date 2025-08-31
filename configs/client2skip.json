@@ -1,0 +1,11 @@
+{
+  "telegramBotToken": "ANOTHER_BOT_TOKEN",
+  "telegramGroups": ["-1234567890"],
+  "whatsappGroups": [],
+  "skipWhatsApp": true,
+  "settings": {
+    "messageDelay": 1000,
+    "maxReconnectAttempts": 5,
+    "enableLogging": true
+  }
+}
