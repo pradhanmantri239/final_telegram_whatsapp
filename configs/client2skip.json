@@ -1,5 +1,5 @@
 {
-  "telegramBotToken": "ANOTHER_BOT_TOKEN",
+  "telegramBotToken": "DISABLED",
   "telegramGroups": ["-1234567890"],
   "whatsappGroups": [],
   "skipWhatsApp": true,
