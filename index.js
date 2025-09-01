@@ -22,7 +22,7 @@ class SingleClientForwarder {
     this.totalMessages = 0;
     this.failedMessages = 0;
     this.availableGroups = [];
-    this.downloadedFiles = new Map(); // Cache for downloaded files
+    this.downloadCache = new Map(); // FIXED: Cache downloaded files
   }
 
   async initializeWhatsApp() {
@@ -284,8 +284,8 @@ class SingleClientForwarder {
           await this.handleDocumentMessage(message);
         }
 
-        // FIXED: Increased delay between different messages (not groups)
-        const messageDelay = Math.floor(Math.random() * 10000) + 15000; // 15-25 seconds
+        // FIXED: Increased delay to prevent WhatsApp logout
+        const messageDelay = Math.floor(Math.random() * 10000) + 20000; // 20-30 seconds
         console.log(`⏳ [${this.clientId}] Waiting ${messageDelay}ms before next message...`);
         await this.sleep(messageDelay);
 
@@ -298,11 +298,11 @@ class SingleClientForwarder {
     this.isProcessingQueue = false;
   }
 
-  // FIXED: Download file once and reuse for all groups
-  async downloadAndCacheFile(fileId) {
-    // Return cached file if already downloaded
-    if (this.downloadedFiles.has(fileId)) {
-      return this.downloadedFiles.get(fileId);
+  // FIXED: Download once and reuse for all groups to save storage
+  async downloadFileOnce(fileId) {
+    if (this.downloadCache.has(fileId)) {
+      console.log(`💾 [${this.clientId}] Using cached file for: ${fileId}`);
+      return this.downloadCache.get(fileId);
     }
 
     console.log(`📥 [${this.clientId}] Downloading file: ${fileId}`);
@@ -313,16 +313,11 @@ class SingleClientForwarder {
     const downloadUrl = `https://api.telegram.org/file/bot${this.config.telegramBotToken}/${fileInfo.file_path}`;
     console.log(`🔗 [${this.clientId}] Download URL: ${downloadUrl}`);
 
-    // Create filename using original naming pattern
-    const fileIndex = this.downloadedFiles.size + 1;
-    const extension = path.extname(fileInfo.file_path) || '.jpg';
-    const fileName = `file_${fileIndex}${extension}`;
+    const fileName = `file_${Date.now()}.jpg`;
     const localPath = path.join('./photos', fileName);
 
-    // Ensure photos directory exists
     await fs.mkdir('./photos', { recursive: true });
 
-    // Download file using original method
     await new Promise((resolve, reject) => {
       const file = require('fs').createWriteStream(localPath);
       https.get(downloadUrl, (response) => {
@@ -338,18 +333,17 @@ class SingleClientForwarder {
     const stats = await fs.stat(localPath);
     console.log(`✅ [${this.clientId}] File downloaded successfully: ${stats.size} bytes`);
 
-    // Cache the file path
-    this.downloadedFiles.set(fileId, localPath);
+    this.downloadCache.set(fileId, localPath);
 
-    // Auto cleanup after processing to save storage
+    // Auto cleanup to save storage
     setTimeout(async () => {
       try {
         await fs.unlink(localPath);
-        this.downloadedFiles.delete(fileId);
+        this.downloadCache.delete(fileId);
       } catch (error) {
         // Ignore cleanup errors
       }
-    }, 180000); // 3 minutes cleanup
+    }, 300000); // 5 minutes
 
     return localPath;
   }
@@ -363,13 +357,11 @@ class SingleClientForwarder {
     }
 
     try {
-      // Get the largest photo (original logic)
       const photo = message.photo[message.photo.length - 1];
       
       // FIXED: Download once, use for all groups
-      const localPath = await this.downloadAndCacheFile(photo.file_id);
+      const localPath = await this.downloadFileOnce(photo.file_id);
 
-      // Send to each group with original timing pattern but longer delays
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
         
@@ -382,9 +374,9 @@ class SingleClientForwarder {
 
           this.totalMessages++;
 
-          // FIXED: Longer delays between groups to prevent logout (was 3-10 seconds, now 60-120 seconds)
+          // FIXED: Much longer delays between groups to prevent logout
           if (i < this.config.whatsappGroups.length - 1) {
-            const groupDelay = Math.floor(Math.random() * 60000) + 60000; // 60-120 seconds
+            const groupDelay = Math.floor(Math.random() * 60000) + 90000; // 90-150 seconds
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
             await this.sleep(groupDelay);
           }
@@ -423,9 +415,9 @@ class SingleClientForwarder {
 
           this.totalMessages++;
 
-          // FIXED: Longer delays for text messages too
+          // FIXED: Longer delays between groups
           if (i < this.config.whatsappGroups.length - 1) {
-            const groupDelay = Math.floor(Math.random() * 30000) + 45000; // 45-75 seconds
+            const groupDelay = Math.floor(Math.random() * 45000) + 60000; // 60-105 seconds
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
             await this.sleep(groupDelay);
           }
@@ -450,8 +442,7 @@ class SingleClientForwarder {
     }
 
     try {
-      // FIXED: Download once, use for all groups
-      const localPath = await this.downloadAndCacheFile(message.video.file_id);
+      const localPath = await this.downloadFileOnce(message.video.file_id);
 
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
@@ -466,7 +457,7 @@ class SingleClientForwarder {
           this.totalMessages++;
 
           if (i < this.config.whatsappGroups.length - 1) {
-            const groupDelay = Math.floor(Math.random() * 60000) + 90000; // 90-150 seconds for video
+            const groupDelay = Math.floor(Math.random() * 60000) + 120000; // 120-180 seconds for video
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
             await this.sleep(groupDelay);
           }
@@ -491,8 +482,7 @@ class SingleClientForwarder {
     }
 
     try {
-      // FIXED: Download once, use for all groups
-      const localPath = await this.downloadAndCacheFile(message.document.file_id);
+      const localPath = await this.downloadFileOnce(message.document.file_id);
 
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
@@ -507,7 +497,7 @@ class SingleClientForwarder {
           this.totalMessages++;
 
           if (i < this.config.whatsappGroups.length - 1) {
-            const groupDelay = Math.floor(Math.random() * 45000) + 60000; // 60-105 seconds
+            const groupDelay = Math.floor(Math.random() * 45000) + 75000; // 75-120 seconds
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
             await this.sleep(groupDelay);
           }
@@ -596,16 +586,15 @@ class MultiClientManager {
             const configData = await fs.readFile(configPath, 'utf8');
             const config = JSON.parse(configData);
             
-            // FIXED: Skip disabled clients BEFORE any validation (your original working logic)
+            // FIXED: Completely skip disabled clients - no initialization at all
             if (!config.telegramBotToken || 
                 config.telegramBotToken === "DISABLED" || 
                 config.telegramBotToken === "ANOTHER_BOT_TOKEN" ||
                 config.telegramBotToken.includes("BOT_TOKEN")) {
-              // Don't even load this config - complete skip
+              console.log(`⏭️ Skipping disabled client: ${path.basename(file, '.json')}`);
               continue;
             }
             
-            // Validate config only for active clients
             if (!config.telegramGroups || !config.whatsappGroups) {
               console.log(`⚠️ Invalid config in ${file}, skipping...`);
               continue;
