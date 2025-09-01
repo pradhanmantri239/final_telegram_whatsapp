@@ -22,10 +22,11 @@ class SingleClientForwarder {
     this.totalMessages = 0;
     this.failedMessages = 0;
     this.availableGroups = [];
+    // FIXED: File cache to download once per message, not per group
+    this.fileCache = new Map();
   }
 
   async initializeWhatsApp() {
-    // Check if WhatsApp should be skipped for this client
     if (this.config.skipWhatsApp === true) {
       console.log(`⏭️ [${this.clientId}] WhatsApp connection skipped by configuration`);
       this.isWhatsAppReady = false;
@@ -33,19 +34,20 @@ class SingleClientForwarder {
     }
 
     console.log(`🚀 [${this.clientId}] Initializing WhatsApp client...`);
-    
-    // FIXED: Use persistent path for Render.com
+
+    // FIXED: Use /tmp for sessions on Render (persists during runtime but not between deploys)
+    // This is intentional - we want sessions to be temporary for security
     const sessionsDir = process.env.RENDER ? 
-      `/opt/render/project/sessions/${this.clientId}` : 
+      `/tmp/sessions/${this.clientId}` : 
       `./sessions/${this.clientId}`;
-      
+
     try {
       await fs.mkdir(sessionsDir, { recursive: true });
       console.log(`📁 [${this.clientId}] Sessions directory: ${sessionsDir}`);
     } catch (error) {
       console.log(`📁 [${this.clientId}] Sessions directory setup complete`);
     }
-    
+
     this.whatsappClient = new Client({
       authStrategy: new LocalAuth({
         clientId: `${this.clientId}`,
@@ -82,37 +84,29 @@ class SingleClientForwarder {
     });
 
     this.whatsappClient.on("qr", (qr) => {
-      console.log(`\n📱 [${this.clientId}] FIRST-TIME SETUP or SESSION EXPIRED`);
+      console.log(`\n📱 [${this.clientId}] QR CODE REQUIRED`);
       console.log(`\n🔑 [${this.clientId}] Scan this QR code with WhatsApp:`);
       qrcode.generate(qr, { small: true });
       const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
       console.log(`\n🔗 [${this.clientId}] QR URL: ${qrUrl}`);
-      console.log(`\n⚠️ [${this.clientId}] After scanning, session will be saved for future use!`);
+      console.log(`\n⚠️ [${this.clientId}] Note: On Render, you'll need to scan QR on each restart`);
     });
 
     this.whatsappClient.on("authenticated", (session) => {
-      console.log(`✅ [${this.clientId}] WhatsApp authenticated - session saved!`);
-      console.log(`🔐 [${this.clientId}] Future starts will use saved session (no QR needed)`);
+      console.log(`✅ [${this.clientId}] WhatsApp authenticated successfully`);
     });
 
     this.whatsappClient.on("ready", async () => {
-      console.log(`🚀 [${this.clientId}] WhatsApp ready! Using ${this.reconnectAttempts === 0 ? 'saved session' : 'fresh connection'}`);
+      console.log(`🚀 [${this.clientId}] WhatsApp ready and connected!`);
       this.isWhatsAppReady = true;
       this.reconnectAttempts = 0;
-      
+
       setTimeout(async () => {
         try {
           await this.displayAvailableChats();
           this.processMessageQueue();
         } catch (error) {
           console.error(`❌ [${this.clientId}] Error displaying chats:`, error.message);
-          setTimeout(async () => {
-            try {
-              await this.displayAvailableChats();
-            } catch (retryError) {
-              console.error(`❌ [${this.clientId}] Retry failed:`, retryError.message);
-            }
-          }, 5000);
         }
       }, 3000);
     });
@@ -126,18 +120,13 @@ class SingleClientForwarder {
     });
 
     this.whatsappClient.on("auth_failure", (msg) => {
-      console.error(`❌ [${this.clientId}] Authentication failed - session may be corrupted:`, msg);
+      console.error(`❌ [${this.clientId}] Authentication failed:`, msg);
       console.log(`🔄 [${this.clientId}] Will show QR code for fresh login...`);
       this.handleWhatsAppReconnect();
     });
 
     this.whatsappClient.on("disconnected", (reason) => {
       console.log(`⚠️ [${this.clientId}] WhatsApp disconnected: ${reason}`);
-      if (reason === 'LOGOUT') {
-        console.log(`🚪 [${this.clientId}] Logged out - will need QR code on next start`);
-      } else {
-        console.log(`🔄 [${this.clientId}] Attempting to reconnect with saved session...`);
-      }
       this.isWhatsAppReady = false;
       this.availableGroups = [];
       this.handleWhatsAppReconnect();
@@ -149,22 +138,21 @@ class SingleClientForwarder {
   async displayAvailableChats() {
     try {
       console.log(`📋 [${this.clientId}] Fetching WhatsApp chats...`);
-      
       const chats = await this.whatsappClient.getChats();
       console.log(`📊 [${this.clientId}] Total chats found: ${chats.length}`);
-      
+
       const groups = chats.filter((chat) => chat.isGroup);
       console.log(`📊 [${this.clientId}] Groups found: ${groups.length}`);
-      
+
       this.availableGroups = groups.map(group => ({
         name: group.name,
         id: group.id._serialized,
         participants: group.participants ? group.participants.length : 0
       }));
-      
+
       console.log(`\n📋 [${this.clientId}] Available WhatsApp Groups:`);
       console.log("=====================================");
-      
+
       if (groups.length === 0) {
         console.log(`❌ [${this.clientId}] No groups found. Make sure you're added to WhatsApp groups.`);
         return;
@@ -173,28 +161,20 @@ class SingleClientForwarder {
       groups.forEach((group, index) => {
         const participantCount = group.participants ? group.participants.length : 0;
         console.log(`${index + 1}. ${group.name}`);
-        console.log(`   📍 ID: ${group.id._serialized}`);
-        console.log(`   👥 Participants: ${participantCount}`);
-        console.log(`   📅 Created: ${group.createdAt ? new Date(group.createdAt.low * 1000).toLocaleDateString() : 'Unknown'}`);
+        console.log(` 📍 ID: ${group.id._serialized}`);
+        console.log(` 👥 Participants: ${participantCount}`);
+        console.log(` 📅 Created: ${group.createdAt ? new Date(group.createdAt.low * 1000).toLocaleDateString() : 'Invalid Date'}`);
         console.log('');
       });
+
       console.log("=====================================\n");
-      
+
       const individualChats = chats.filter(chat => !chat.isGroup);
       console.log(`📊 [${this.clientId}] Individual chats: ${individualChats.length}`);
       console.log(`📊 [${this.clientId}] Total chats: ${chats.length}\n`);
-      
+
     } catch (error) {
       console.error(`❌ [${this.clientId}] Error getting chats:`, error.message);
-      console.error(`❌ [${this.clientId}] Error details:`, error);
-      
-      try {
-        console.log(`🔄 [${this.clientId}] Trying alternative method to get chats...`);
-        const state = await this.whatsappClient.getState();
-        console.log(`📊 [${this.clientId}] WhatsApp state: ${state}`);
-      } catch (stateError) {
-        console.error(`❌ [${this.clientId}] Could not get WhatsApp state:`, stateError.message);
-      }
     }
   }
 
@@ -222,338 +202,377 @@ class SingleClientForwarder {
 
   initializeTelegram() {
     console.log(`🚀 [${this.clientId}] Initializing Telegram bot...`);
-    
-    this.telegramBot = new TelegramBot(this.config.telegramBotToken, {
-      polling: true,
-    });
+    console.log(`🔑 [${this.clientId}] Bot token: ${this.config.telegramBotToken ? 'Present' : 'MISSING'}`);
+    console.log(`📋 [${this.clientId}] Monitoring groups: ${JSON.stringify(this.config.telegramGroups)}`);
 
-    this.telegramBot.on("message", async (msg) => {
-      if (!this.isActive) {
-        console.log(`⏸️ [${this.clientId}] Forwarding paused, message skipped`);
-        return;
-      }
+    try {
+      this.telegramBot = new TelegramBot(this.config.telegramBotToken, {
+        polling: true,
+      });
 
-      try {
-        const chatId = msg.chat.id.toString();
-        if (!this.config.telegramGroups || !this.config.telegramGroups.includes(chatId)) {
+      this.telegramBot.on("message", async (msg) => {
+        console.log(`📨 [${this.clientId}] Telegram message received from chat: ${msg.chat.id}`);
+        
+        if (!this.isActive) {
+          console.log(`⏸️ [${this.clientId}] Forwarding paused, message skipped`);
           return;
         }
-        await this.handleTelegramMessage(msg);
-      } catch (error) {
-        console.error(`❌ [${this.clientId}] Error processing Telegram message:`, error.message);
-      }
-    });
 
-    this.telegramBot.on("polling_error", (error) => {
-      console.error(`❌ [${this.clientId}] Telegram polling error:`, error.message);
-    });
+        try {
+          const chatId = msg.chat.id;
 
-    console.log(`✅ [${this.clientId}] Telegram bot initialized and listening`);
-  }
+          // Check if this is from a monitored group
+          if (!this.config.telegramGroups.includes(chatId)) {
+            console.log(`⏭️ [${this.clientId}] Message from unmonitored group ${chatId}, skipping`);
+            return;
+          }
 
-  async handleTelegramMessage(msg) {
-    const messageInfo = {
-      text: msg.text || msg.caption || "",
-      from: msg.from.first_name + (msg.from.last_name ? ` ${msg.from.last_name}` : ""),
-      chat: msg.chat.title || "Private Chat",
-      timestamp: new Date(msg.date * 1000).toLocaleString(),
-      type: "text",
-    };
+          console.log(`✅ [${this.clientId}] Message from monitored group, adding to queue`);
 
-    if (msg.photo) {
-      messageInfo.type = "photo";
-      messageInfo.fileId = msg.photo[msg.photo.length - 1].file_id;
-    } else if (msg.document) {
-      messageInfo.type = "document";
-      messageInfo.fileId = msg.document.file_id;
-      messageInfo.fileName = msg.document.file_name;
-    } else if (msg.video) {
-      messageInfo.type = "video";
-      messageInfo.fileId = msg.video.file_id;
-    } else if (msg.audio || msg.voice) {
-      messageInfo.type = "audio";
-      messageInfo.fileId = (msg.audio || msg.voice).file_id;
-    }
+          // Add message to queue
+          this.messageQueue.push(msg);
+          console.log(`📨 [${this.clientId}] New message queued: ${msg.text ? 'text' : (msg.photo ? 'photo' : 'other')}`);
 
-    this.messageQueue.push(messageInfo);
-    console.log(`📨 [${this.clientId}] New message queued: ${messageInfo.type}`);
+          // Process queue if not already processing
+          if (!this.isProcessingQueue) {
+            this.processMessageQueue();
+          }
 
-    if (!this.isProcessingQueue) {
-      this.processMessageQueue();
+        } catch (error) {
+          console.error(`❌ [${this.clientId}] Error handling Telegram message:`, error.message);
+        }
+      });
+
+      this.telegramBot.on('polling_error', (error) => {
+        console.error(`⚠️ [${this.clientId}] Telegram polling error:`, error.message);
+      });
+
+      // Verify the bot is working
+      this.telegramBot.getMe().then(botInfo => {
+        console.log(`✅ [${this.clientId}] Telegram bot verified: @${botInfo.username} (ID: ${botInfo.id})`);
+        console.log(`📋 [${this.clientId}] Ready to monitor Telegram groups: ${this.config.telegramGroups.join(', ')}`);
+      }).catch(error => {
+        console.error(`❌ [${this.clientId}] Bot verification failed:`, error.message);
+      });
+
+    } catch (error) {
+      console.error(`❌ [${this.clientId}] Critical error initializing Telegram:`, error.message);
     }
   }
 
-  // FIXED: Updated delays - 8-13 seconds between messages
   async processMessageQueue() {
     if (this.isProcessingQueue || this.messageQueue.length === 0) {
       return;
     }
 
     this.isProcessingQueue = true;
+    console.log(`🔄 [${this.clientId}] Processing ${this.messageQueue.length} messages in queue`);
 
     while (this.messageQueue.length > 0) {
-      if (!this.isActive) {
-        console.log(`⏸️ [${this.clientId}] Forwarding paused`);
-        await this.sleep(5000);
-        continue;
+      const message = this.messageQueue.shift();
+      
+      try {
+        if (message.photo && message.photo.length > 0) {
+          await this.handlePhotoMessage(message);
+        } else if (message.text) {
+          await this.handleTextMessage(message);
+        } else if (message.video) {
+          await this.handleVideoMessage(message);
+        } else if (message.document) {
+          await this.handleDocumentMessage(message);
+        }
+
+        // Delay between different messages
+        const messageDelay = Math.floor(Math.random() * 10000) + 20000; // 20-30 seconds
+        console.log(`⏳ [${this.clientId}] Waiting ${messageDelay}ms before next message...`);
+        await this.sleep(messageDelay);
+
+      } catch (error) {
+        console.error(`❌ [${this.clientId}] Error processing message:`, error.message);
+        this.failedMessages++;
       }
-
-      // Skip forwarding if WhatsApp is disabled for this client
-      if (this.config.skipWhatsApp === true) {
-        console.log(`⏭️ [${this.clientId}] WhatsApp skipped - clearing message queue`);
-        this.messageQueue = [];
-        break;
-      }
-
-      if (!this.isWhatsAppReady) {
-        console.log(`⏳ [${this.clientId}] WhatsApp not ready, waiting...`);
-        await this.sleep(5000);
-        continue;
-      }
-
-      const messageInfo = this.messageQueue.shift();
-      await this.forwardToWhatsApp(messageInfo);
-
-      // FIXED: 8-13 seconds delay between messages
-      const messageDelay = Math.floor(Math.random() * 5000) + 8000; // 8000-13000ms
-      console.log(`⏳ [${this.clientId}] Waiting ${messageDelay}ms before next message...`);
-      await this.sleep(messageDelay);
     }
 
     this.isProcessingQueue = false;
   }
 
-  // FIXED: Updated group delays and fixed file download
-  async forwardToWhatsApp(messageInfo) {
-    // Skip forwarding if WhatsApp is disabled for this client
-    if (this.config.skipWhatsApp === true) {
-      console.log(`⏭️ [${this.clientId}] WhatsApp forwarding skipped (client configured as Telegram-only)`);
-      return;
+  // FIXED: Download file once and cache it for all groups
+  async downloadAndCacheFile(fileId) {
+    // Check if file is already cached
+    if (this.fileCache.has(fileId)) {
+      console.log(`💾 [${this.clientId}] Using cached file for: ${fileId}`);
+      return this.fileCache.get(fileId);
     }
 
-    if (!this.config.whatsappGroups || this.config.whatsappGroups.length === 0) {
-      console.log(`⚠️ [${this.clientId}] No WhatsApp groups configured, skipping message`);
-      return;
-    }
+    console.log(`📥 [${this.clientId}] Downloading file: ${fileId}`);
+    
+    const fileInfo = await this.telegramBot.getFile(fileId);
+    console.log(`📋 [${this.clientId}] File info:`, { path: fileInfo.file_path, size: fileInfo.file_size });
 
-    if (!this.isWhatsAppReady) {
-      console.log(`⏳ [${this.clientId}] WhatsApp not ready, message will stay in queue`);
-      return;
-    }
+    const downloadUrl = `https://api.telegram.org/file/bot${this.config.telegramBotToken}/${fileInfo.file_path}`;
 
-    let messageText = messageInfo.text;
-    if (messageText) {
-      const randomVariation = this.messageVariations[Math.floor(Math.random() * this.messageVariations.length)];
-      messageText = messageInfo.text + randomVariation;
-    }
+    // Create unique filename
+    const timestamp = Date.now();
+    const extension = path.extname(fileInfo.file_path) || '.jpg';
+    const fileName = `file_${timestamp}${extension}`;
+    const localPath = path.join('/tmp', fileName);
 
-    for (let i = 0; i < this.config.whatsappGroups.length; i++) {
-      const groupId = this.config.whatsappGroups[i];
-      
+    // Download file to /tmp (available on Render)
+    await new Promise((resolve, reject) => {
+      const file = require('fs').createWriteStream(localPath);
+      https.get(downloadUrl, (response) => {
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          resolve();
+        });
+        file.on('error', reject);
+      }).on('error', reject);
+    });
+
+    const stats = await fs.stat(localPath);
+    console.log(`✅ [${this.clientId}] File downloaded: ${stats.size} bytes to ${localPath}`);
+
+    // Cache the file path
+    this.fileCache.set(fileId, localPath);
+
+    // Auto cleanup after 5 minutes to save space
+    setTimeout(async () => {
       try {
-        if (messageInfo.type === "text" && messageText) {
-          await this.whatsappClient.sendMessage(groupId, messageText, { linkPreview: false });
-          console.log(`✅ [${this.clientId}] Text message sent to WhatsApp group ${i + 1} (no preview)`);
-        } else if (messageInfo.fileId) {
-          console.log(`📎 [${this.clientId}] Processing ${messageInfo.type} file...`);
-          const mediaData = await this.downloadTelegramFile(messageInfo.fileId);
-          if (mediaData) {
-            const media = new MessageMedia(
-              mediaData.mimeType, 
-              mediaData.buffer.toString('base64'), 
-              mediaData.fileName
-            );
-            await this.whatsappClient.sendMessage(groupId, media, { 
-              caption: messageText || "",
-              linkPreview: false
-            });
-            console.log(`✅ [${this.clientId}] ${messageInfo.type} message sent to WhatsApp group ${i + 1} (no preview)`);
-          } else {
-            console.log(`❌ [${this.clientId}] Failed to download ${messageInfo.type} file`);
-            this.failedMessages++;
-            continue;
-          }
-        }
-
-        this.totalMessages++;
+        await fs.unlink(localPath);
+        this.fileCache.delete(fileId);
+        console.log(`🧹 [${this.clientId}] Cleaned up file: ${fileName}`);
       } catch (error) {
-        console.error(`❌ [${this.clientId}] Failed to send message to group ${i + 1}:`, error.message);
-        this.failedMessages++;
+        // Ignore cleanup errors
       }
+    }, 300000); // 5 minutes
 
-      // FIXED: 3-5 seconds delay between groups
-      if (i < this.config.whatsappGroups.length - 1) {
-        const groupDelay = Math.floor(Math.random() * 2000) + 3000; // 3000-5000ms
-        console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
-        await this.sleep(groupDelay);
-      }
-    }
+    return localPath;
   }
 
-  // FIXED: Complete file download implementation
-  async downloadTelegramFile(fileId) {
+  async handlePhotoMessage(message) {
+    console.log(`📎 [${this.clientId}] Processing photo file...`);
+
+    if (!this.isWhatsAppReady || this.config.whatsappGroups.length === 0) {
+      console.log(`⚠️ [${this.clientId}] WhatsApp not ready or no groups configured`);
+      return;
+    }
+
     try {
-      console.log(`📥 [${this.clientId}] Downloading file: ${fileId}`);
+      const photo = message.photo[message.photo.length - 1];
       
-      // Get file info from Telegram
-      const fileInfo = await this.telegramBot.getFile(fileId);
-      console.log(`📋 [${this.clientId}] File info:`, {
-        path: fileInfo.file_path,
-        size: fileInfo.file_size
-      });
+      // FIXED: Download once, use for all groups
+      const localPath = await this.downloadAndCacheFile(photo.file_id);
 
-      if (!fileInfo.file_path) {
-        throw new Error('File path not available from Telegram API');
-      }
+      // Send to each group with delays
+      for (let i = 0; i < this.config.whatsappGroups.length; i++) {
+        const groupId = this.config.whatsappGroups[i];
+        
+        try {
+          const media = MessageMedia.fromFilePath(localPath);
+          const variation = this.messageVariations[Math.floor(Math.random() * this.messageVariations.length)];
+          
+          await this.whatsappClient.sendMessage(groupId, media, { caption: variation });
+          console.log(`✅ [${this.clientId}] Photo sent to WhatsApp group ${i + 1}`);
 
-      // Construct the download URL
-      const fileUrl = `https://api.telegram.org/file/bot${this.config.telegramBotToken}/${fileInfo.file_path}`;
-      console.log(`🔗 [${this.clientId}] Download URL: ${fileUrl}`);
+          this.totalMessages++;
 
-      // Download file as buffer using https module
-      const buffer = await new Promise((resolve, reject) => {
-        const chunks = [];
-        https.get(fileUrl, (response) => {
-          if (response.statusCode !== 200) {
-            reject(new Error(`Failed to download file: ${response.statusCode}`));
-            return;
+          // FIXED: Longer delays between groups to prevent logout
+          if (i < this.config.whatsappGroups.length - 1) {
+            const groupDelay = Math.floor(Math.random() * 60000) + 90000; // 90-150 seconds
+            console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
+            await this.sleep(groupDelay);
           }
 
-          response.on('data', (chunk) => chunks.push(chunk));
-          response.on('end', () => {
-            const fileBuffer = Buffer.concat(chunks);
-            console.log(`✅ [${this.clientId}] File downloaded successfully: ${fileBuffer.length} bytes`);
-            resolve(fileBuffer);
-          });
-          response.on('error', reject);
-        }).on('error', reject);
-      });
-
-      // Determine MIME type and filename
-      const fileName = fileInfo.file_path.split('/').pop() || 'file';
-      const mimeType = this.getMimeTypeFromPath(fileInfo.file_path);
-
-      return {
-        buffer: buffer,
-        mimeType: mimeType,
-        fileName: fileName
-      };
+        } catch (error) {
+          console.error(`❌ [${this.clientId}] Error sending to group ${i + 1}:`, error.message);
+          this.failedMessages++;
+        }
+      }
 
     } catch (error) {
-      console.error(`❌ [${this.clientId}] Error downloading file:`, error.message);
-      return null;
+      console.error(`❌ [${this.clientId}] Error in photo handling:`, error.message);
     }
   }
 
-  // Helper function to determine MIME type from file path
-  getMimeTypeFromPath(filePath) {
-    const extension = filePath.split('.').pop().toLowerCase();
-    const mimeTypes = {
-      'jpg': 'image/jpeg',
-      'jpeg': 'image/jpeg',
-      'png': 'image/png',
-      'gif': 'image/gif',
-      'webp': 'image/webp',
-      'mp4': 'video/mp4',
-      'mov': 'video/quicktime',
-      'avi': 'video/x-msvideo',
-      'mp3': 'audio/mpeg',
-      'wav': 'audio/wav',
-      'ogg': 'audio/ogg',
-      'pdf': 'application/pdf',
-      'doc': 'application/msword',
-      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'txt': 'text/plain'
-    };
-    return mimeTypes[extension] || 'application/octet-stream';
-  }
+  async handleTextMessage(message) {
+    console.log(`📝 [${this.clientId}] Processing text message: "${message.text}"`);
 
-  getMimeType(type) {
-    const mimeTypes = {
-      photo: "image/jpeg",
-      video: "video/mp4",
-      audio: "audio/mpeg",
-      voice: "audio/ogg",
-      document: "application/octet-stream",
-    };
-    return mimeTypes[type] || "application/octet-stream";
-  }
-
-  getFileExtension(type) {
-    const extensions = {
-      photo: "jpg",
-      video: "mp4",
-      audio: "mp3",
-      voice: "ogg",
-      document: "bin",
-    };
-    return extensions[type] || "bin";
-  }
-
-  // Add skip function
-  skipCurrentMessage() {
-    if (this.messageQueue.length > 0) {
-      const skippedMessage = this.messageQueue.shift();
-      console.log(`⏭️ [${this.clientId}] Skipped message: ${skippedMessage.type}`);
-      return true;
+    if (!this.isWhatsAppReady || this.config.whatsappGroups.length === 0) {
+      console.log(`⚠️ [${this.clientId}] WhatsApp not ready or no groups configured`);
+      return;
     }
-    console.log(`⏭️ [${this.clientId}] No message in queue to skip`);
-    return false;
+
+    try {
+      const text = message.text;
+
+      for (let i = 0; i < this.config.whatsappGroups.length; i++) {
+        const groupId = this.config.whatsappGroups[i];
+        
+        try {
+          const variation = this.messageVariations[Math.floor(Math.random() * this.messageVariations.length)];
+          const messageToSend = text + variation;
+
+          await this.whatsappClient.sendMessage(groupId, messageToSend);
+          console.log(`✅ [${this.clientId}] Text sent to WhatsApp group ${i + 1}`);
+
+          this.totalMessages++;
+
+          // Delay between groups
+          if (i < this.config.whatsappGroups.length - 1) {
+            const groupDelay = Math.floor(Math.random() * 45000) + 60000; // 60-105 seconds
+            console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
+            await this.sleep(groupDelay);
+          }
+
+        } catch (error) {
+          console.error(`❌ [${this.clientId}] Error sending text to group ${i + 1}:`, error.message);
+          this.failedMessages++;
+        }
+      }
+
+    } catch (error) {
+      console.error(`❌ [${this.clientId}] Error in text handling:`, error.message);
+    }
   }
 
-  // Add pause/resume functions
-  pause() {
-    this.isActive = false;
-    console.log(`⏸️ [${this.clientId}] Forwarding paused`);
+  async handleVideoMessage(message) {
+    console.log(`🎥 [${this.clientId}] Processing video file...`);
+
+    if (!this.isWhatsAppReady || this.config.whatsappGroups.length === 0) {
+      console.log(`⚠️ [${this.clientId}] WhatsApp not ready or no groups configured`);
+      return;
+    }
+
+    try {
+      const localPath = await this.downloadAndCacheFile(message.video.file_id);
+
+      for (let i = 0; i < this.config.whatsappGroups.length; i++) {
+        const groupId = this.config.whatsappGroups[i];
+        
+        try {
+          const media = MessageMedia.fromFilePath(localPath);
+          const variation = this.messageVariations[Math.floor(Math.random() * this.messageVariations.length)];
+
+          await this.whatsappClient.sendMessage(groupId, media, { caption: variation });
+          console.log(`✅ [${this.clientId}] Video sent to WhatsApp group ${i + 1}`);
+
+          this.totalMessages++;
+
+          if (i < this.config.whatsappGroups.length - 1) {
+            const groupDelay = Math.floor(Math.random() * 60000) + 120000; // 120-180 seconds for video
+            console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
+            await this.sleep(groupDelay);
+          }
+
+        } catch (error) {
+          console.error(`❌ [${this.clientId}] Error sending video to group ${i + 1}:`, error.message);
+          this.failedMessages++;
+        }
+      }
+
+    } catch (error) {
+      console.error(`❌ [${this.clientId}] Error in video handling:`, error.message);
+    }
   }
 
-  resume() {
-    this.isActive = true;
-    console.log(`▶️ [${this.clientId}] Forwarding resumed`);
-    if (this.messageQueue.length > 0 && !this.isProcessingQueue) {
-      this.processMessageQueue();
+  async handleDocumentMessage(message) {
+    console.log(`📄 [${this.clientId}] Processing document file...`);
+
+    if (!this.isWhatsAppReady || this.config.whatsappGroups.length === 0) {
+      console.log(`⚠️ [${this.clientId}] WhatsApp not ready or no groups configured`);
+      return;
+    }
+
+    try {
+      const localPath = await this.downloadAndCacheFile(message.document.file_id);
+
+      for (let i = 0; i < this.config.whatsappGroups.length; i++) {
+        const groupId = this.config.whatsappGroups[i];
+        
+        try {
+          const media = MessageMedia.fromFilePath(localPath);
+          const variation = this.messageVariations[Math.floor(Math.random() * this.messageVariations.length)];
+
+          await this.whatsappClient.sendMessage(groupId, media, { caption: variation });
+          console.log(`✅ [${this.clientId}] Document sent to WhatsApp group ${i + 1}`);
+
+          this.totalMessages++;
+
+          if (i < this.config.whatsappGroups.length - 1) {
+            const groupDelay = Math.floor(Math.random() * 45000) + 75000; // 75-120 seconds
+            console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
+            await this.sleep(groupDelay);
+          }
+
+        } catch (error) {
+          console.error(`❌ [${this.clientId}] Error sending document to group ${i + 1}:`, error.message);
+          this.failedMessages++;
+        }
+      }
+
+    } catch (error) {
+      console.error(`❌ [${this.clientId}] Error in document handling:`, error.message);
     }
   }
 
   sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async start() {
     console.log(`🚀 [${this.clientId}] Starting forwarder...`);
     
-    // Only initialize WhatsApp if not skipped
-    if (!this.config.skipWhatsApp) {
+    try {
+      console.log(`🎯 [${this.clientId}] Step 1: Starting WhatsApp...`);
       await this.initializeWhatsApp();
-    } else {
-      console.log(`⏭️ [${this.clientId}] WhatsApp initialization skipped - Telegram only mode`);
+      
+      console.log(`🎯 [${this.clientId}] Step 2: Starting Telegram...`);
+      this.initializeTelegram();
+      
+      console.log(`✅ [${this.clientId}] Both services initialization started`);
+      
+    } catch (error) {
+      console.error(`❌ [${this.clientId}] Failed to start:`, error.message);
+      throw error;
     }
-    
-    // Always initialize Telegram
-    this.initializeTelegram();
+  }
+
+  pause() {
+    console.log(`⏸️ [${this.clientId}] Pausing message forwarding...`);
+    this.isActive = false;
+  }
+
+  resume() {
+    console.log(`▶️ [${this.clientId}] Resuming message forwarding...`);
+    this.isActive = true;
+    if (!this.isProcessingQueue && this.messageQueue.length > 0) {
+      this.processMessageQueue();
+    }
   }
 
   async stop() {
     console.log(`🛑 [${this.clientId}] Stopping forwarder...`);
     this.isActive = false;
+
+    if (this.telegramBot) {
+      await this.telegramBot.stopPolling();
+    }
+
     if (this.whatsappClient) {
       await this.whatsappClient.destroy();
     }
-    if (this.telegramBot) {
-      this.telegramBot.stopPolling();
-    }
   }
 
-  getStats() {
+  getStatus() {
     return {
       clientId: this.clientId,
       isActive: this.isActive,
       isWhatsAppReady: this.isWhatsAppReady,
-      whatsappSkipped: this.config.skipWhatsApp || false,
       totalMessages: this.totalMessages,
       failedMessages: this.failedMessages,
-      queueLength: this.messageQueue.length,
-      availableGroups: this.availableGroups.length,
+      queueSize: this.messageQueue.length,
+      availableGroups: this.availableGroups.length
     };
   }
 }
@@ -561,51 +580,51 @@ class SingleClientForwarder {
 class MultiClientManager {
   constructor() {
     this.clients = new Map();
+    this.configs = [];
     this.app = express();
-    this.port = process.env.PORT || 3000;
   }
 
-  async loadClientConfig(clientId) {
+  async loadConfigs() {
     try {
-      const configPath = `./configs/${clientId}.json`;
-      const configData = await fs.readFile(configPath, 'utf8');
-      return JSON.parse(configData);
-    } catch (error) {
-      console.error(`❌ Failed to load config for ${clientId}:`, error.message);
-      throw error;
-    }
-  }
-
-  async startClient(clientId) {
-    try {
-      if (this.clients.has(clientId)) {
-        console.log(`⚠️ Client ${clientId} is already running`);
-        return;
+      const configFiles = await fs.readdir('./configs');
+      
+      for (const file of configFiles) {
+        if (file.endsWith('.json')) {
+          try {
+            const configPath = path.join('./configs', file);
+            const configData = await fs.readFile(configPath, 'utf8');
+            const config = JSON.parse(configData);
+            
+            // Skip disabled clients
+            if (!config.telegramBotToken || 
+                config.telegramBotToken === "DISABLED" || 
+                config.telegramBotToken === "ANOTHER_BOT_TOKEN" ||
+                config.telegramBotToken.includes("BOT_TOKEN")) {
+              console.log(`⏭️ Skipping disabled client: ${path.basename(file, '.json')}`);
+              continue;
+            }
+            
+            if (!config.telegramGroups || !config.whatsappGroups) {
+              console.log(`⚠️ Invalid config in ${file}, skipping...`);
+              continue;
+            }
+            
+            const clientId = path.basename(file, '.json');
+            config.clientId = clientId;
+            this.configs.push(config);
+            
+            console.log(`✅ Loaded config for client: ${clientId}`);
+          } catch (error) {
+            console.error(`❌ Error loading config ${file}:`, error.message);
+          }
+        }
       }
-
-      const config = await this.loadClientConfig(clientId);
-      const client = new SingleClientForwarder(clientId, config);
       
-      this.clients.set(clientId, client);
-      await client.start();
+      console.log(`📊 Total valid configs loaded: ${this.configs.length}`);
       
-      console.log(`✅ Client ${clientId} started successfully`);
     } catch (error) {
-      console.error(`❌ Failed to start client ${clientId}:`, error.message);
+      console.error(`❌ Error reading configs directory:`, error.message);
     }
-  }
-
-  async stopClient(clientId) {
-    if (!this.clients.has(clientId)) {
-      console.log(`⚠️ Client ${clientId} is not running`);
-      return;
-    }
-
-    const client = this.clients.get(clientId);
-    await client.stop();
-    this.clients.delete(clientId);
-    
-    console.log(`🛑 Client ${clientId} stopped successfully`);
   }
 
   setupAPI() {
@@ -613,323 +632,96 @@ class MultiClientManager {
 
     this.app.get('/', (req, res) => {
       res.json({
-        status: 'Multi-Client Telegram to WhatsApp Forwarder',
-        clients: Array.from(this.clients.keys()),
-        timestamp: new Date().toISOString()
+        status: 'Multi-Client Telegram-WhatsApp Forwarder',
+        version: '1.0.0',
+        clients: this.configs.length,
+        uptime: process.uptime()
       });
     });
 
-    this.app.get('/clients', (req, res) => {
-      const clientStats = Array.from(this.clients.entries()).map(([id, client]) => ({
-        id,
-        ...client.getStats()
-      }));
-      res.json(clientStats);
+    this.app.get('/status', (req, res) => {
+      const statuses = Array.from(this.clients.values()).map(client => client.getStatus());
+      res.json({
+        clients: statuses,
+        totalClients: this.clients.size,
+        activeClients: statuses.filter(s => s.isActive).length,
+        readyClients: statuses.filter(s => s.isWhatsAppReady).length
+      });
     });
 
-    // Dashboard HTML
-    this.app.get('/dashboard', (req, res) => {
-      const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Client Manager Dashboard</title>
-        <style>
-          body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-          .header { background: #2196F3; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-          .client { border: 1px solid #ddd; margin: 15px 0; padding: 20px; border-radius: 8px; background: white; }
-          .active { border-left: 5px solid #4CAF50; }
-          .inactive { border-left: 5px solid #f44336; }
-          .paused { border-left: 5px solid #ff9800; }
-          .skipped { border-left: 5px solid #9C27B0; }
-          button { margin: 5px; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
-          .start-btn { background: #4CAF50; color: white; }
-          .pause-btn { background: #ff9800; color: white; }
-          .resume-btn { background: #2196F3; color: white; }
-          .stop-btn { background: #f44336; color: white; }
-          .skip-btn { background: #9C27B0; color: white; }
-          .status { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin: 5px; }
-          .status-active { background: #4CAF50; color: white; }
-          .status-inactive { background: #f44336; color: white; }
-          .status-skipped { background: #9C27B0; color: white; }
-          .stats { margin: 10px 0; font-size: 14px; color: #666; }
-          .add-client { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <h1>📱 Multi-Client Telegram → WhatsApp Forwarder</h1>
-          <p>Manage your forwarding clients remotely</p>
-          <button onclick="refreshStatus()" style="background:rgba(255,255,255,0.2);color:white;border:1px solid white;">🔄 Refresh Status</button>
-        </div>
-        
-        <div class="add-client">
-          <h3>➕ Add New Client</h3>
-          <input type="text" id="newClientId" placeholder="Enter client ID (e.g., client2)" style="padding: 8px; margin: 5px; width: 200px;">
-          <button onclick="addNewClient()" class="start-btn">🚀 Add & Start Client</button>
-          <p style="font-size: 12px; color: #666;">Make sure the config file exists in /configs/ folder</p>
-        </div>
-        
-        <div id="clients"></div>
-        
-        <script>
-          async function controlClient(clientId, action) {
-            try {
-              const response = await fetch(\`/clients/\${clientId}/\${action}\`, {method: 'POST'});
-              const result = await response.json();
-              if (result.success) {
-                showMessage(result.message, 'success');
-              } else {
-                showMessage(result.error, 'error');
-              }
-              setTimeout(refreshStatus, 1000);
-            } catch (error) {
-              showMessage('Error: ' + error.message, 'error');
-            }
-          }
-          
-          async function skipMessage(clientId) {
-            try {
-              const response = await fetch(\`/clients/\${clientId}/skip\`, {method: 'POST'});
-              const result = await response.json();
-              showMessage(result.message, result.success ? 'success' : 'error');
-              setTimeout(refreshStatus, 1000);
-            } catch (error) {
-              showMessage('Error: ' + error.message, 'error');
-            }
-          }
-          
-          async function toggleWhatsApp(clientId, skip) {
-            try {
-              const response = await fetch(\`/clients/\${clientId}/toggle-whatsapp\`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({skip: skip})
-              });
-              const result = await response.json();
-              showMessage(result.message, result.success ? 'success' : 'error');
-              setTimeout(refreshStatus, 2000);
-            } catch (error) {
-              showMessage('Error: ' + error.message, 'error');
-            }
-          }
-          
-          async function addNewClient() {
-            const clientId = document.getElementById('newClientId').value.trim();
-            if (!clientId) {
-              showMessage('Please enter a client ID', 'error');
-              return;
-            }
-            await controlClient(clientId, 'start');
-            document.getElementById('newClientId').value = '';
-          }
-          
-          function showMessage(message, type) {
-            const div = document.createElement('div');
-            div.style.cssText = \`position:fixed;top:20px;right:20px;padding:15px;border-radius:5px;z-index:1000;
-              background:\${type === 'success' ? '#4CAF50' : '#f44336'};color:white;font-weight:bold;\`;
-            div.textContent = message;
-            document.body.appendChild(div);
-            setTimeout(() => div.remove(), 3000);
-          }
-          
-          async function refreshStatus() {
-            try {
-              const response = await fetch('/clients');
-              const clients = await response.json();
-              
-              const container = document.getElementById('clients');
-              container.innerHTML = '';
-              
-              if (clients.length === 0) {
-                container.innerHTML = '<div class="client"><p style="text-align:center;color:#666;">No clients running. Add a new client above.</p></div>';
-                return;
-              }
-              
-              clients.forEach(client => {
-                const div = document.createElement('div');
-                let statusClass = 'inactive';
-                if (client.whatsappSkipped) statusClass = 'skipped';
-                else if (client.isActive && client.isWhatsAppReady) statusClass = 'active';
-                else if (client.isActive && !client.isWhatsAppReady) statusClass = 'inactive';
-                else statusClass = 'paused';
-                
-                div.className = \`client \${statusClass}\`;
-                div.innerHTML = \`
-                  <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <div>
-                      <h3>\${client.id}</h3>
-                      <span class="status \${client.isActive ? 'status-active' : 'status-inactive'}">
-                        \${client.isActive ? '🟢 ACTIVE' : '🔴 PAUSED'}
-                      </span>
-                      \${client.whatsappSkipped ? 
-                        '<span class="status status-skipped">📵 WhatsApp SKIPPED</span>' : 
-                        \`<span class="status \${client.isWhatsAppReady ? 'status-active' : 'status-inactive'}">
-                          \${client.isWhatsAppReady ? '📱 Connected (Saved Session)' : '📱 Disconnected (May Need QR)'}
-                        </span>\`
-                      }
-                    </div>
-                    <div>
-                      <button class="start-btn" onclick="controlClient('\${client.id}', 'start')" title="Start/Restart client">🚀 Start</button>
-                      <button class="pause-btn" onclick="controlClient('\${client.id}', 'pause')" title="Pause forwarding">⏸️ Pause</button>
-                      <button class="resume-btn" onclick="controlClient('\${client.id}', 'resume')" title="Resume forwarding">▶️ Resume</button>
-                      <button class="skip-btn" onclick="skipMessage('\${client.id}')" title="Skip current message">⏭️ Skip Msg</button>
-                      \${!client.whatsappSkipped ? 
-                        '<button class="skip-btn" onclick="toggleWhatsApp(\'' + client.id + '\', true)" title="Skip WhatsApp for this client">📵 Skip WhatsApp</button>' :
-                        '<button class="resume-btn" onclick="toggleWhatsApp(\'' + client.id + '\', false)" title="Enable WhatsApp for this client">📱 Enable WhatsApp</button>'
-                      }
-                      <button class="stop-btn" onclick="controlClient('\${client.id}', 'stop')" title="Stop client completely">🛑 Stop</button>
-                    </div>
-                  </div>
-                  <div class="stats">
-                    📊 Messages: \${client.totalMessages} sent, \${client.failedMessages} failed | 
-                    📬 Queue: \${client.queueLength} pending | 
-                    👥 Groups: \${client.availableGroups} available
-                    \${client.whatsappSkipped ? ' | 📵 Telegram-only mode' : ''}
-                  </div>
-                \`;
-                container.appendChild(div);
-              });
-            } catch (error) {
-              console.error('Failed to refresh status:', error);
-            }
-          }
-          
-          // Auto refresh every 15 seconds
-          setInterval(refreshStatus, 15000);
-          
-          // Load initial status
-          refreshStatus();
-        </script>
-      </body>
-      </html>
-      `;
-      res.send(html);
-    });
-
-    // Skip message API
-    this.app.post('/clients/:clientId/skip', (req, res) => {
-      const client = this.clients.get(req.params.clientId);
-      if (client) {
-        const skipped = client.skipCurrentMessage();
-        res.json({ 
-          success: true, 
-          message: skipped ? `Skipped current message for ${req.params.clientId}` : `No message to skip for ${req.params.clientId}`
-        });
-      } else {
-        res.status(404).json({ success: false, error: 'Client not found' });
-      }
-    });
-
-    // Toggle WhatsApp API
-    this.app.post('/clients/:clientId/toggle-whatsapp', async (req, res) => {
-      const client = this.clients.get(req.params.clientId);
-      if (!client) {
-        return res.status(404).json({ success: false, error: 'Client not found' });
-      }
-
-      const { skip } = req.body;
-      
-      try {
-        client.config.skipWhatsApp = skip;
-        
-        if (skip) {
-          if (client.whatsappClient) {
-            await client.whatsappClient.destroy();
-            client.whatsappClient = null;
-          }
-          client.isWhatsAppReady = false;
-          client.messageQueue = [];
-          console.log(`📵 [${req.params.clientId}] WhatsApp disabled`);
-          res.json({ success: true, message: `WhatsApp disabled for ${req.params.clientId}` });
-        } else {
-          console.log(`📱 [${req.params.clientId}] Enabling WhatsApp...`);
-          await client.initializeWhatsApp();
-          res.json({ success: true, message: `WhatsApp enabled for ${req.params.clientId} - check logs for QR code if needed` });
-        }
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // Start client API
-    this.app.post('/clients/:clientId/start', async (req, res) => {
-      try {
-        await this.startClient(req.params.clientId);
-        res.json({ success: true, message: `Client ${req.params.clientId} started` });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    // Pause client API
-    this.app.post('/clients/:clientId/pause', (req, res) => {
+    this.app.post('/client/:clientId/pause', (req, res) => {
       const client = this.clients.get(req.params.clientId);
       if (client) {
         client.pause();
-        res.json({ success: true, message: `Client ${req.params.clientId} paused` });
+        res.json({ message: `Client ${req.params.clientId} paused` });
       } else {
-        res.status(404).json({ success: false, error: 'Client not found' });
+        res.status(404).json({ error: 'Client not found' });
       }
     });
 
-    // Resume client API
-    this.app.post('/clients/:clientId/resume', (req, res) => {
+    this.app.post('/client/:clientId/resume', (req, res) => {
       const client = this.clients.get(req.params.clientId);
       if (client) {
         client.resume();
-        res.json({ success: true, message: `Client ${req.params.clientId} resumed` });
+        res.json({ message: `Client ${req.params.clientId} resumed` });
       } else {
-        res.status(404).json({ success: false, error: 'Client not found' });
+        res.status(404).json({ error: 'Client not found' });
       }
     });
 
-    // Stop client API
-    this.app.post('/clients/:clientId/stop', async (req, res) => {
-      try {
-        await this.stopClient(req.params.clientId);
-        res.json({ success: true, message: `Client ${req.params.clientId} stopped` });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    this.app.listen(this.port, () => {
-      console.log(`🌐 API server running on port ${this.port}`);
+    const port = process.env.PORT || 10000;
+    this.app.listen(port, '0.0.0.0', () => {
+      console.log(`🌐 API server running on port ${port}`);
     });
   }
 
   async start() {
     console.log('🚀 Starting Multi-Client Manager...');
     
+    await this.loadConfigs();
     this.setupAPI();
-    
-    // Auto-start client1
-    try {
-      await this.startClient('client1');
-    } catch (error) {
-      console.log('⚠️ client1 config not found or failed to start - use dashboard to add clients');
+
+    if (this.configs.length === 0) {
+      console.log('❌ No valid configurations found. Please check your ./configs/ directory');
+      return;
     }
+
+    for (const config of this.configs) {
+      try {
+        const forwarder = new SingleClientForwarder(config.clientId, config);
+        this.clients.set(config.clientId, forwarder);
+        await forwarder.start();
+        
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } catch (error) {
+        console.error(`❌ Failed to start client ${config.clientId}:`, error.message);
+      }
+    }
+  }
+
+  async stop() {
+    console.log('\n🛑 Shutting down gracefully...');
+    
+    for (const [clientId, client] of this.clients.entries()) {
+      console.log(`🛑 [${clientId}] Stopping forwarder...`);
+      try {
+        await client.stop();
+      } catch (error) {
+        console.error(`❌ Error stopping client ${clientId}:`, error.message);
+      }
+    }
+    
+    process.exit(0);
   }
 }
 
-// Start the application
 const manager = new MultiClientManager();
-manager.start().catch(console.error);
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  for (const [clientId, client] of manager.clients) {
-    await client.stop();
-  }
-  process.exit(0);
-});
+process.on('SIGINT', () => manager.stop());
+process.on('SIGTERM', () => manager.stop());
+process.on('SIGQUIT', () => manager.stop());
 
-process.on('SIGTERM', async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  for (const [clientId, client] of manager.clients) {
-    await client.stop();
-  }
-  process.exit(0);
+manager.start().catch(error => {
+  console.error('❌ Failed to start application:', error.message);
+  process.exit(1);
 });
