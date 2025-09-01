@@ -283,7 +283,10 @@ class SingleClientForwarder {
 
   initializeTelegram() {
     console.log(`🚀 [${this.clientId}] Initializing Telegram bot...`);
-
+    if (this.config.skipTelegram === true || !this.config.telegramBotToken || this.config.telegramBotToken === "DISABLED") {
+    console.log(`⏭️ [${this.clientId}] Telegram connection skipped by configuration`);
+    return;
+    }
     this.telegramBot = new TelegramBot(this.config.telegramBotToken, {
       polling: true,
     });
