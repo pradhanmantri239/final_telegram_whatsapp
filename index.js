@@ -211,37 +211,41 @@ class SingleClientForwarder {
       });
 
       this.telegramBot.on("message", async (msg) => {
-        console.log(`📨 [${this.clientId}] Telegram message received from chat: ${msg.chat.id}`);
-        
-        if (!this.isActive) {
-          console.log(`⏸️ [${this.clientId}] Forwarding paused, message skipped`);
-          return;
-        }
+  console.log(`📨 [${this.clientId}] Telegram message received from chat: ${msg.chat.id}`);
+  
+  if (!this.isActive) {
+    console.log(`⏸️ [${this.clientId}] Forwarding paused, message skipped`);
+    return;
+  }
 
-        try {
-          const chatId = msg.chat.id;
+  try {
+    const chatId = msg.chat.id;
 
-          // Check if this is from a monitored group
-          if (!this.config.telegramGroups.includes(chatId)) {
-            console.log(`⏭️ [${this.clientId}] Message from unmonitored group ${chatId}, skipping`);
-            return;
-          }
+    // FIXED: Convert both to strings for comparison
+    const chatIdStr = String(chatId);
+    const monitoredGroups = this.config.telegramGroups.map(id => String(id));
+    
+    // Check if this is from a monitored group
+    if (!monitoredGroups.includes(chatIdStr)) {
+      console.log(`⏭️ [${this.clientId}] Message from unmonitored group ${chatId}, skipping`);
+      return;
+    }
 
-          console.log(`✅ [${this.clientId}] Message from monitored group, adding to queue`);
+    console.log(`✅ [${this.clientId}] Message from monitored group, adding to queue`);
 
-          // Add message to queue
-          this.messageQueue.push(msg);
-          console.log(`📨 [${this.clientId}] New message queued: ${msg.text ? 'text' : (msg.photo ? 'photo' : 'other')}`);
+    // Add message to queue
+    this.messageQueue.push(msg);
+    console.log(`📨 [${this.clientId}] New message queued: ${msg.text ? 'text' : (msg.photo ? 'photo' : 'other')}`);
 
-          // Process queue if not already processing
-          if (!this.isProcessingQueue) {
-            this.processMessageQueue();
-          }
+    // Process queue if not already processing
+    if (!this.isProcessingQueue) {
+      this.processMessageQueue();
+    }
 
-        } catch (error) {
-          console.error(`❌ [${this.clientId}] Error handling Telegram message:`, error.message);
-        }
-      });
+  } catch (error) {
+    console.error(`❌ [${this.clientId}] Error handling Telegram message:`, error.message);
+  }
+});
 
       this.telegramBot.on('polling_error', (error) => {
         console.error(`⚠️ [${this.clientId}] Telegram polling error:`, error.message);
