@@ -22,10 +22,11 @@ class SingleClientForwarder {
     this.totalMessages = 0;
     this.failedMessages = 0;
     this.availableGroups = [];
-    this.downloadedFiles = new Map();
+    this.downloadedFiles = new Map(); // Cache for downloaded files
   }
 
   async initializeWhatsApp() {
+    // Check if WhatsApp should be skipped for this client
     if (this.config.skipWhatsApp === true) {
       console.log(`⏭️ [${this.clientId}] WhatsApp connection skipped by configuration`);
       this.isWhatsAppReady = false;
@@ -34,6 +35,7 @@ class SingleClientForwarder {
 
     console.log(`🚀 [${this.clientId}] Initializing WhatsApp client...`);
 
+    // FIXED: Use persistent path for Render.com
     const sessionsDir = process.env.RENDER ? 
       `/opt/render/project/sessions/${this.clientId}` : 
       `./sessions/${this.clientId}`;
@@ -235,13 +237,16 @@ class SingleClientForwarder {
       try {
         const chatId = msg.chat.id;
 
+        // Check if this is from a monitored group
         if (!this.config.telegramGroups.includes(chatId)) {
           return;
         }
 
+        // Add message to queue
         this.messageQueue.push(msg);
         console.log(`📨 [${this.clientId}] New message queued: ${msg.text ? 'text' : (msg.photo ? 'photo' : 'other')}`);
 
+        // Process queue if not already processing
         if (!this.isProcessingQueue) {
           this.processMessageQueue();
         }
@@ -256,56 +261,6 @@ class SingleClientForwarder {
     });
 
     console.log(`✅ [${this.clientId}] Telegram bot initialized`);
-  }
-
-  // ONLY FIX: Download once and reuse for all groups
-  async downloadFileOnce(fileId) {
-    if (this.downloadedFiles.has(fileId)) {
-      console.log(`💾 [${this.clientId}] Using cached file for: ${fileId}`);
-      return this.downloadedFiles.get(fileId);
-    }
-
-    console.log(`📥 [${this.clientId}] Downloading file: ${fileId}`);
-    
-    const fileInfo = await this.telegramBot.getFile(fileId);
-    console.log(`📋 [${this.clientId}] File info:`, { path: fileInfo.file_path, size: fileInfo.file_size });
-
-    const downloadUrl = `https://api.telegram.org/file/bot${this.config.telegramBotToken}/${fileInfo.file_path}`;
-    console.log(`🔗 [${this.clientId}] Download URL: ${downloadUrl}`);
-
-    const fileName = `file_${Date.now()}.jpg`;
-    const localPath = path.join('./photos', fileName);
-
-    await fs.mkdir('./photos', { recursive: true });
-
-    await new Promise((resolve, reject) => {
-      const file = require('fs').createWriteStream(localPath);
-      https.get(downloadUrl, (response) => {
-        response.pipe(file);
-        file.on('finish', () => {
-          file.close();
-          resolve();
-        });
-        file.on('error', reject);
-      }).on('error', reject);
-    });
-
-    const stats = await fs.stat(localPath);
-    console.log(`✅ [${this.clientId}] File downloaded successfully: ${stats.size} bytes`);
-
-    this.downloadedFiles.set(fileId, localPath);
-
-    // Clean up after use to save storage
-    setTimeout(async () => {
-      try {
-        await fs.unlink(localPath);
-        this.downloadedFiles.delete(fileId);
-      } catch (error) {
-        // Ignore cleanup errors
-      }
-    }, 300000);
-
-    return localPath;
   }
 
   async processMessageQueue() {
@@ -329,8 +284,8 @@ class SingleClientForwarder {
           await this.handleDocumentMessage(message);
         }
 
-        // FIXED: Longer delay to prevent logout
-        const messageDelay = Math.floor(Math.random() * 10000) + 20000; // 20-30 seconds
+        // FIXED: Increased delay between different messages (not groups)
+        const messageDelay = Math.floor(Math.random() * 10000) + 15000; // 15-25 seconds
         console.log(`⏳ [${this.clientId}] Waiting ${messageDelay}ms before next message...`);
         await this.sleep(messageDelay);
 
@@ -343,6 +298,62 @@ class SingleClientForwarder {
     this.isProcessingQueue = false;
   }
 
+  // FIXED: Download file once and reuse for all groups
+  async downloadAndCacheFile(fileId) {
+    // Return cached file if already downloaded
+    if (this.downloadedFiles.has(fileId)) {
+      return this.downloadedFiles.get(fileId);
+    }
+
+    console.log(`📥 [${this.clientId}] Downloading file: ${fileId}`);
+    
+    const fileInfo = await this.telegramBot.getFile(fileId);
+    console.log(`📋 [${this.clientId}] File info:`, { path: fileInfo.file_path, size: fileInfo.file_size });
+
+    const downloadUrl = `https://api.telegram.org/file/bot${this.config.telegramBotToken}/${fileInfo.file_path}`;
+    console.log(`🔗 [${this.clientId}] Download URL: ${downloadUrl}`);
+
+    // Create filename using original naming pattern
+    const fileIndex = this.downloadedFiles.size + 1;
+    const extension = path.extname(fileInfo.file_path) || '.jpg';
+    const fileName = `file_${fileIndex}${extension}`;
+    const localPath = path.join('./photos', fileName);
+
+    // Ensure photos directory exists
+    await fs.mkdir('./photos', { recursive: true });
+
+    // Download file using original method
+    await new Promise((resolve, reject) => {
+      const file = require('fs').createWriteStream(localPath);
+      https.get(downloadUrl, (response) => {
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          resolve();
+        });
+        file.on('error', reject);
+      }).on('error', reject);
+    });
+
+    const stats = await fs.stat(localPath);
+    console.log(`✅ [${this.clientId}] File downloaded successfully: ${stats.size} bytes`);
+
+    // Cache the file path
+    this.downloadedFiles.set(fileId, localPath);
+
+    // Auto cleanup after processing to save storage
+    setTimeout(async () => {
+      try {
+        await fs.unlink(localPath);
+        this.downloadedFiles.delete(fileId);
+      } catch (error) {
+        // Ignore cleanup errors
+      }
+    }, 180000); // 3 minutes cleanup
+
+    return localPath;
+  }
+
   async handlePhotoMessage(message) {
     console.log(`📎 [${this.clientId}] Processing photo file...`);
 
@@ -352,11 +363,13 @@ class SingleClientForwarder {
     }
 
     try {
+      // Get the largest photo (original logic)
       const photo = message.photo[message.photo.length - 1];
       
       // FIXED: Download once, use for all groups
-      const localPath = await this.downloadFileOnce(photo.file_id);
+      const localPath = await this.downloadAndCacheFile(photo.file_id);
 
+      // Send to each group with original timing pattern but longer delays
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
         
@@ -369,7 +382,7 @@ class SingleClientForwarder {
 
           this.totalMessages++;
 
-          // FIXED: Much longer delays to prevent logout
+          // FIXED: Longer delays between groups to prevent logout (was 3-10 seconds, now 60-120 seconds)
           if (i < this.config.whatsappGroups.length - 1) {
             const groupDelay = Math.floor(Math.random() * 60000) + 60000; // 60-120 seconds
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
@@ -410,6 +423,7 @@ class SingleClientForwarder {
 
           this.totalMessages++;
 
+          // FIXED: Longer delays for text messages too
           if (i < this.config.whatsappGroups.length - 1) {
             const groupDelay = Math.floor(Math.random() * 30000) + 45000; // 45-75 seconds
             console.log(`⏳ [${this.clientId}] Waiting ${groupDelay}ms before next group...`);
@@ -436,7 +450,8 @@ class SingleClientForwarder {
     }
 
     try {
-      const localPath = await this.downloadFileOnce(message.video.file_id);
+      // FIXED: Download once, use for all groups
+      const localPath = await this.downloadAndCacheFile(message.video.file_id);
 
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
@@ -476,7 +491,8 @@ class SingleClientForwarder {
     }
 
     try {
-      const localPath = await this.downloadFileOnce(message.document.file_id);
+      // FIXED: Download once, use for all groups
+      const localPath = await this.downloadAndCacheFile(message.document.file_id);
 
       for (let i = 0; i < this.config.whatsappGroups.length; i++) {
         const groupId = this.config.whatsappGroups[i];
@@ -579,21 +595,23 @@ class MultiClientManager {
             const configPath = path.join('./configs', file);
             const configData = await fs.readFile(configPath, 'utf8');
             const config = JSON.parse(configData);
-            const clientId = path.basename(file, '.json');
             
-            // FIXED: Skip disabled clients completely (no initialization at all)
+            // FIXED: Skip disabled clients BEFORE any validation (your original working logic)
             if (!config.telegramBotToken || 
                 config.telegramBotToken === "DISABLED" || 
-                config.telegramBotToken === "ANOTHER_BOT_TOKEN") {
-              console.log(`⏭️ Skipping disabled client: ${clientId}`);
-              continue; // Don't even load this config
+                config.telegramBotToken === "ANOTHER_BOT_TOKEN" ||
+                config.telegramBotToken.includes("BOT_TOKEN")) {
+              // Don't even load this config - complete skip
+              continue;
             }
             
+            // Validate config only for active clients
             if (!config.telegramGroups || !config.whatsappGroups) {
               console.log(`⚠️ Invalid config in ${file}, skipping...`);
               continue;
             }
             
+            const clientId = path.basename(file, '.json');
             config.clientId = clientId;
             this.configs.push(config);
             
@@ -671,12 +689,14 @@ class MultiClientManager {
       return;
     }
 
+    // Start each client
     for (const config of this.configs) {
       try {
         const forwarder = new SingleClientForwarder(config.clientId, config);
         this.clients.set(config.clientId, forwarder);
         await forwarder.start();
         
+        // Delay between starting clients
         await new Promise(resolve => setTimeout(resolve, 5000));
       } catch (error) {
         console.error(`❌ Failed to start client ${config.clientId}:`, error.message);
@@ -687,6 +707,7 @@ class MultiClientManager {
   async stop() {
     console.log('\n🛑 Shutting down gracefully...');
     
+    // Stop all clients
     for (const [clientId, client] of this.clients.entries()) {
       console.log(`🛑 [${clientId}] Stopping forwarder...`);
       try {
@@ -700,12 +721,15 @@ class MultiClientManager {
   }
 }
 
+// Create and start manager
 const manager = new MultiClientManager();
 
+// Graceful shutdown handlers
 process.on('SIGINT', () => manager.stop());
 process.on('SIGTERM', () => manager.stop());
 process.on('SIGQUIT', () => manager.stop());
 
+// Start the application
 manager.start().catch(error => {
   console.error('❌ Failed to start application:', error.message);
   process.exit(1);
