@@ -108,7 +108,7 @@ class SingleClientForwarder {
         } catch (error) {
           console.error(`❌ [${this.clientId}] Error displaying chats:`, error.message);
         }
-      }, 3000);
+      }, 5000);
     });
 
     this.whatsappClient.on('loading_screen', (percent, message) => {
